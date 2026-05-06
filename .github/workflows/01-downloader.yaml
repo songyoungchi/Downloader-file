@@ -80,6 +80,7 @@ jobs:
           }
 
           get_unique_name() {
+            # Kept for compatibility, but not used in this flow
             local BASE_PATH="$1"
             local NAME="$2"
             local IS_DIR="$3"
@@ -168,21 +169,26 @@ jobs:
           download_with_retry() {
             local URL="$1"
             local FILENAME="$2"
-            local MAX_RETRIES=3
-            local RETRY_DELAY=5
+            local MAX_RETRIES=2
             local SUCCESS=false
             local ERROR_LOG=""
+            local EXPECTED_SIZE=0
+            local ACTUAL_SIZE=0
+
+            # Get expected file size from server headers
+            EXPECTED_SIZE=$(curl -sI -L "$URL" | grep -i content-length | tail -1 | awk '{print $2}' | tr -d '\r') || true
+            echo "Expected size from server: ${EXPECTED_SIZE:-unknown} bytes"
 
             for ((attempt=1; attempt<=MAX_RETRIES; attempt++)); do
               echo "Attempt $attempt of $MAX_RETRIES for $FILENAME"
 
               ERROR_LOG=$(aria2c \
-                --split=2 \
-                --max-connection-per-server=2 \
+                --split=4 \
+                --max-connection-per-server=4 \
                 --min-split-size=20M \
                 --max-tries=3 \
                 --retry-wait=5 \
-                --timeout=60 \
+                --timeout=120 \
                 --connect-timeout=30 \
                 --follow-torrent=false \
                 --check-certificate=false \
@@ -203,20 +209,43 @@ jobs:
                 -o "tmp_downloads/$FILENAME" \
                 "$URL" 2>&1) && SUCCESS=true && break
 
-              echo "Waiting ${RETRY_DELAY}s before retry..."
-              sleep $RETRY_DELAY
-              RETRY_DELAY=$((RETRY_DELAY * 2))
+              echo "Waiting 5s before retry..."
+              sleep 5
             done
 
             if [ "$SUCCESS" = true ] && [ -f "tmp_downloads/$FILENAME" ]; then
-              if [ -s "tmp_downloads/$FILENAME" ]; then
-                echo "Successfully downloaded: $FILENAME"
-                return 0
-              else
+              ACTUAL_SIZE=$(stat -c%s "tmp_downloads/$FILENAME" 2>/dev/null || echo 0)
+              echo "Downloaded size: $ACTUAL_SIZE bytes"
+
+              # Verification 1: Size mismatch with expected Content-Length
+              if [ -n "$EXPECTED_SIZE" ] && [ "$EXPECTED_SIZE" -gt 0 ] && [ "$ACTUAL_SIZE" -lt $(( EXPECTED_SIZE * 95 / 100 )) ]; then
+                echo "❌ Size mismatch! Expected $EXPECTED_SIZE bytes, got $ACTUAL_SIZE bytes"
                 rm -f "tmp_downloads/$FILENAME"
-                create_error_file "$FILENAME" "Downloaded file is empty (0 bytes). The server may have returned an error page instead of the actual file." "$URL"
+                create_error_file "$FILENAME" "Downloaded file size ($ACTUAL_SIZE bytes) is much smaller than expected ($EXPECTED_SIZE bytes). The server likely returned an error page or the transfer was incomplete." "$URL"
                 return 1
               fi
+
+              # Verification 2: Suspiciously small file that looks like HTML
+              if [ "$ACTUAL_SIZE" -lt 5000 ]; then
+                HEAD=$(head -c 200 "tmp_downloads/$FILENAME")
+                if echo "$HEAD" | grep -qi '<!DOCTYPE\|<html\|Error\|404\|403'; then
+                  echo "❌ Downloaded file appears to be an HTML error page."
+                  rm -f "tmp_downloads/$FILENAME"
+                  create_error_file "$FILENAME" "Server returned an HTML error page instead of the file. Detected HTML content in first 200 bytes. Size: $ACTUAL_SIZE bytes." "$URL"
+                  return 1
+                fi
+              fi
+
+              # Verification 3: Unknown expected size, but file is extremely small (<10KB)
+              if { [ -z "$EXPECTED_SIZE" ] || [ "$EXPECTED_SIZE" -eq 0 ]; } && [ "$ACTUAL_SIZE" -lt 10240 ]; then
+                echo "⚠️ No size info provided, and file is only $ACTUAL_SIZE bytes. Treating as likely error."
+                rm -f "tmp_downloads/$FILENAME"
+                create_error_file "$FILENAME" "Downloaded file is only $ACTUAL_SIZE bytes, and the server did not provide a Content-Length header. This is probably an error page." "$URL"
+                return 1
+              fi
+
+              echo "✅ Download verified successfully."
+              return 0
             else
               create_error_file "$FILENAME" "$ERROR_LOG" "$URL"
               return 1
@@ -230,6 +259,7 @@ jobs:
             download_with_retry "$URL" "$FILENAME" || echo "Failed to download: $FILENAME"
           done
 
+          # ---- Post-download: Zip or Normal mode ----
           if [ "$MODE" = "zip" ]; then
             if [ -n "$(ls -A tmp_downloads 2>/dev/null)" ]; then
               ARCHIVE_NAME="archive_$(date +%Y%m%d_%H%M%S)"
@@ -282,6 +312,7 @@ jobs:
             fi
             rm -rf tmp_downloads
           else
+            # Normal mode: individual files
             for FILE in tmp_downloads/*; do
               [ -f "$FILE" ] || continue
               SIZE=$(stat -c%s "$FILE")
